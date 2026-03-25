@@ -1745,6 +1745,328 @@ Builtins.apply_configuration = function(args)
 end
 
 -- ═══════════════════════════════════════════════════════════
+-- ANALYZE + CONFIGURE — Combined _G + GUI discovery
+-- ═══════════════════════════════════════════════════════════
+--[[
+    The ultimate script loader command. Most Roblox hub scripts
+    expose their toggles via _G (global table) AND/OR GUI elements.
+    This command discovers BOTH, applies desired options through
+    whichever method works, and returns a complete control map.
+
+    Host sends:
+    {
+        "cmd": "analyze_and_configure_script",
+        "args": {
+            "url": "https://rawscripts.net/raw/...",
+            "desired_options": {"AutoFarm": true, "FarmChest": true, "Speed": 2.5},
+            "min_wait": 6,
+            "max_wait": 12,
+            "name": "nubla_x"
+        }
+    }
+
+    Returns:
+    {
+        "ok": true,
+        "result": {
+            "fetched": true, "executed": true, "is_armored": false,
+            "globals_before": {"AutoFarm": "false", ...},
+            "globals_after":  {"AutoFarm": "true", ...},
+            "gui_elements": [...],
+            "options_applied": 2, "options_failed": [],
+            "source_path": "dablox/scripts/nubla_x.luau",
+            "log": [...]
+        }
+    }
+
+    Host can pull raw source:
+        adb shell cat "/sdcard/Arceus X/Workspace/dablox/scripts/nubla_x.luau"
+]]
+
+Builtins.analyze_and_configure_script = function(args)
+    local url = args.url or ""
+    local desired = args.desired_options or args.options or {}
+    local minWait = args.min_wait or 6
+    local maxWait = args.max_wait or 12
+    local scriptName = args.name or "downloaded_script"
+
+    if #url < 10 then return { id = 0, ok = false, error = "no url provided" } end
+
+    CurrentCmd = "analyze_and_configure"
+    local report = {
+        url = url,
+        script_name = scriptName,
+        fetched = false,
+        source_bytes = 0,
+        source_saved = false,
+        source_path = "",
+        is_armored = false,
+        executed = false,
+        gui_wait_ms = 0,
+        new_guis = {},
+        -- _G discovery
+        globals_before = {},
+        globals_after = {},
+        globals_found = 0,
+        -- GUI discovery
+        gui_elements = {},
+        gui_element_count = 0,
+        -- Options
+        options_requested = 0,
+        options_applied = 0,
+        options_failed = {},
+        options_method = {},  -- which method was used for each option
+        log = {},
+    }
+
+    local function rlog(msg: string)
+        table.insert(report.log, msg)
+        log("AnalyzeCfg: " .. msg)
+    end
+
+    -- ─── Step 1: Snapshot _G before script loads ─────────
+    local gBefore = {}
+    for k, v in pairs(_G) do
+        if type(v) == "boolean" or type(v) == "number" or type(v) == "string" then
+            gBefore[k] = tostring(v)
+        end
+    end
+    rlog("Snapshot: " .. #(function() local n = 0; for _ in pairs(gBefore) do n += 1 end; return tostring(n) end)() .. " _G keys before load")
+
+    -- ─── Step 2: Snapshot existing GUIs ──────────────────
+    local guiBefore = snapshotGuis()
+
+    -- ─── Step 3: Fetch the script ────────────────────────
+    rlog("Fetching: " .. url)
+    local fetchOk, scriptCode = pcall(function()
+        return game:HttpGet(url, false)  -- no cache
+    end)
+    if not fetchOk or type(scriptCode) ~= "string" or #scriptCode < 20 then
+        -- Retry with cache
+        fetchOk, scriptCode = pcall(function() return game:HttpGet(url, true) end)
+    end
+    if not fetchOk or type(scriptCode) ~= "string" or #scriptCode < 20 then
+        rlog("FAILED: fetch error: " .. tostring(scriptCode))
+        CurrentCmd = ""
+        return { id = 0, ok = false, error = "fetch failed", result = report }
+    end
+
+    report.fetched = true
+    report.source_bytes = #scriptCode
+    rlog("Downloaded " .. #scriptCode .. " bytes")
+
+    -- Detect LuaArmor/obfuscation
+    local firstNL = scriptCode:find("\n") or #scriptCode
+    if scriptCode:find("LPH_") or (scriptCode:find("getfenv") and #scriptCode > 10000)
+       or (not scriptCode:find("function") and #scriptCode > 5000)
+       or firstNL > 5000 then
+        report.is_armored = true
+        rlog("Detected: LuaArmor/obfuscated script")
+    else
+        rlog("Detected: Plain Luau script")
+    end
+
+    -- ─── Step 4: Save raw source ─────────────────────────
+    pcall(function() makefolder("dablox/scripts") end)
+    local savePath = "dablox/scripts/" .. scriptName .. ".luau"
+    local saveOk = pcall(function() writefile(savePath, scriptCode) end)
+    if saveOk then
+        report.source_saved = true
+        report.source_path = savePath
+        rlog("Source saved: " .. savePath)
+    end
+
+    -- ─── Step 5: Execute ─────────────────────────────────
+    rlog("Executing...")
+    local fn, compileErr = loadstring(scriptCode, "@script:" .. scriptName)
+    if not fn then
+        rlog("COMPILE ERROR: " .. tostring(compileErr))
+        CurrentCmd = ""
+        return { id = 0, ok = false, error = "compile: " .. tostring(compileErr), result = report }
+    end
+    local execOk, execErr = pcall(fn)
+    if not execOk then
+        rlog("EXEC ERROR: " .. tostring(execErr))
+        CurrentCmd = ""
+        return { id = 0, ok = false, error = "exec: " .. tostring(execErr), result = report }
+    end
+    report.executed = true
+    rlog("Script executed OK")
+
+    -- ─── Step 6: Wait for GUI + _G population ───────────
+    rlog("Waiting for GUI + _G (min=" .. minWait .. "s max=" .. maxWait .. "s)...")
+    local waitStart = os.clock()
+    local newGuis: { Instance } = {}
+    local guiDetectedAt = 0
+
+    while (os.clock() - waitStart) < maxWait do
+        task.wait(0.5)
+        newGuis = findNewGuis(guiBefore)
+        if #newGuis > 0 and guiDetectedAt == 0 then
+            guiDetectedAt = os.clock() - waitStart
+            rlog("New GUI at " .. string.format("%.1f", guiDetectedAt) .. "s")
+            local remaining = math.max(2, minWait - guiDetectedAt)
+            task.wait(remaining)
+            newGuis = findNewGuis(guiBefore)
+            break
+        end
+    end
+
+    report.gui_wait_ms = math.floor((os.clock() - waitStart) * 1000)
+    for _, gui in ipairs(newGuis) do
+        table.insert(report.new_guis, gui.Name)
+    end
+
+    -- ─── Step 7: Discover _G changes ─────────────────────
+    rlog("Scanning _G for new keys...")
+    local gAfter = {}
+    local newKeys = {}
+    for k, v in pairs(_G) do
+        if type(v) == "boolean" or type(v) == "number" or type(v) == "string" then
+            gAfter[k] = tostring(v)
+            if not gBefore[k] then
+                table.insert(newKeys, k)
+            end
+        end
+    end
+    report.globals_before = gBefore
+    report.globals_after = gAfter
+    report.globals_found = #newKeys
+    rlog("Found " .. #newKeys .. " new _G keys: " .. table.concat(newKeys, ", "))
+
+    -- ─── Step 8: Scan GUI elements ───────────────────────
+    rlog("Scanning GUI elements...")
+    local scanTargets = #newGuis > 0 and newGuis or nil
+    local guiElements = scanGuiElements(scanTargets)
+    report.gui_element_count = #guiElements
+    for _, el in ipairs(guiElements) do
+        table.insert(report.gui_elements, {
+            text = el.text,
+            key = el.cleanText,
+            type = el.elementType,
+            state = el.state,
+            class = el.className,
+            gui = el.guiName,
+            path = el.path,
+        })
+    end
+    rlog("Found " .. #guiElements .. " GUI elements")
+
+    -- ─── Step 9: Apply desired options ───────────────────
+    local optionCount = 0
+    for _ in pairs(desired) do optionCount += 1 end
+    report.options_requested = optionCount
+
+    if optionCount == 0 then
+        rlog("No options requested — scan-only mode")
+        CurrentCmd = ""
+        return { id = 0, ok = true, result = report }
+    end
+
+    rlog("Applying " .. optionCount .. " options (trying _G first, then GUI)...")
+
+    for optName, desiredVal in pairs(desired) do
+        local applied = false
+        local method = "none"
+
+        -- METHOD 1: _G direct set (fastest + most reliable)
+        local cleanName = cleanOptionKey(optName)
+        for gKey, gVal in pairs(gAfter) do
+            local gClean = cleanOptionKey(gKey)
+            if gClean == cleanName or gClean:find(cleanName) or cleanName:find(gClean) then
+                -- Check if already correct
+                local currentVal = _G[gKey]
+                if tostring(currentVal) == tostring(desiredVal) then
+                    rlog("  ~ " .. optName .. " — already " .. tostring(desiredVal) .. " via _G." .. gKey)
+                    applied = true
+                    method = "_G (already set)"
+                else
+                    _G[gKey] = desiredVal
+                    rlog("  ✓ " .. optName .. " → _G." .. gKey .. " = " .. tostring(desiredVal))
+                    applied = true
+                    method = "_G"
+                end
+                break
+            end
+        end
+
+        -- METHOD 2: GUI click (fallback if _G didn't have it)
+        if not applied then
+            local searchGuis: { Instance } = {}
+            if #newGuis > 0 then
+                searchGuis = newGuis
+            else
+                pcall(function()
+                    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+                    if pg then for _, c in ipairs(pg:GetChildren()) do if c:IsA("ScreenGui") then table.insert(searchGuis, c) end end end
+                end)
+                pcall(function()
+                    for _, c in ipairs(game:GetService("CoreGui"):GetChildren()) do if c:IsA("ScreenGui") then table.insert(searchGuis, c) end end
+                end)
+            end
+
+            for attempt = 1, 3 do
+                local clicked, detail = findAndClick(searchGuis, optName)
+                if clicked then
+                    rlog("  ✓ " .. optName .. " → GUI click (" .. detail .. ")")
+                    applied = true
+                    method = "GUI click"
+                    break
+                end
+                if attempt < 3 then task.wait(0.3) end
+            end
+        end
+
+        -- METHOD 3: getgenv() direct set (some scripts use this instead of _G)
+        if not applied then
+            pcall(function()
+                if getgenv then
+                    local genv = getgenv()
+                    for gKey, _ in pairs(genv) do
+                        if type(gKey) == "string" then
+                            local gClean = cleanOptionKey(gKey)
+                            if gClean == cleanName then
+                                genv[gKey] = desiredVal
+                                rlog("  ✓ " .. optName .. " → getgenv()." .. gKey .. " = " .. tostring(desiredVal))
+                                applied = true
+                                method = "getgenv"
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+
+        report.options_method[optName] = method
+        if applied then
+            report.options_applied += 1
+        else
+            table.insert(report.options_failed, optName)
+            rlog("  ✗ " .. optName .. " — not found in _G, GUI, or getgenv()")
+        end
+    end
+
+    -- ─── Step 10: Post-apply _G snapshot ─────────────────
+    task.wait(0.5)
+    local gFinal = {}
+    for k, v in pairs(_G) do
+        if type(v) == "boolean" or type(v) == "number" or type(v) == "string" then
+            gFinal[k] = tostring(v)
+        end
+    end
+    report.globals_after = gFinal
+
+    -- ─── Step 11: Save analysis file ─────────────────────
+    pcall(function()
+        writefile("dablox/analysis.json", encode(report))
+    end)
+
+    rlog("Complete: " .. report.options_applied .. "/" .. optionCount .. " applied")
+    CurrentCmd = ""
+    return { id = 0, ok = true, result = report }
+end
+
+-- ═══════════════════════════════════════════════════════════
 -- Safety overrides
 -- ═══════════════════════════════════════════════════════════
 
